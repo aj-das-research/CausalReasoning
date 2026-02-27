@@ -1,24 +1,19 @@
 """
 model_loader_and_checker.py - Load VLM, verify architecture, and run sanity checks.
 
-Responsibilities:
-  1. Load Qwen2-VL (or compatible VLM) from HuggingFace with correct settings.
-  2. Load and configure the image processor with pixel limits.
-  3. Run a sanity-check forward pass with a dummy image + text prompt.
-  4. Verify the model can generate text in the expected R1 format.
-  5. Print model architecture summary and memory footprint.
+Supports Qwen2-VL (2B) and Qwen2.5-VL (3B/7B) model families.
 
 Usage:
-  python model_loader_and_checker.py                     # full check
-  python model_loader_and_checker.py --model-id <id>     # check a specific model
+  python model_loader_and_checker.py                      # full check with default model
+  python model_loader_and_checker.py --model-id Qwen/Qwen2-VL-2B-Instruct
   python model_loader_and_checker.py --checkpoint <path>  # check a fine-tuned checkpoint
+  python model_loader_and_checker.py --method baseline    # check with baseline prompts
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
-import sys
 from pathlib import Path
 
 import torch
@@ -32,8 +27,9 @@ from transformers import (
 from config import (
     EVAL_CFG,
     MODEL_ID,
-    SYSTEM_PROMPT,
     TRAIN_CFG,
+    Method,
+    get_prompts,
 )
 
 
@@ -58,21 +54,15 @@ def load_model_and_processor(
 ) -> tuple:
     """Load the VLM model and processor.
 
-    Args:
-        model_id: HuggingFace model identifier.
-        checkpoint_path: Path to a fine-tuned checkpoint (overrides model_id).
-        device: Target device (auto-detected if None).
-        max_pixels: Maximum image pixels for the processor.
-        min_pixels: Minimum image pixels for the processor.
-        dtype: Model precision (auto-detected based on device if None).
+    Automatically selects the correct model class based on the model_id:
+      - "qwen2.5-vl" -> Qwen2_5_VLForConditionalGeneration
+      - "qwen2-vl"   -> Qwen2VLForConditionalGeneration
 
-    Returns:
-        (model, processor, device_str)
+    Returns (model, processor, device_str).
     """
     device = device or detect_device()
     load_path = checkpoint_path or model_id
 
-    # Auto-select dtype
     if dtype is None:
         if device == "cuda" and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
@@ -92,7 +82,6 @@ def load_model_and_processor(
     else:
         model_cls = Qwen2VLForConditionalGeneration
 
-    # Load model
     model = model_cls.from_pretrained(
         load_path,
         torch_dtype=dtype,
@@ -105,7 +94,7 @@ def load_model_and_processor(
 
     model.eval()
 
-    # Load processor
+    # Load processor — always from the base model_id (not checkpoint)
     processor = AutoProcessor.from_pretrained(model_id)
     processor.image_processor.max_pixels = max_pixels
     processor.image_processor.min_pixels = min_pixels
@@ -121,10 +110,7 @@ def print_model_summary(model) -> dict:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
 
-    # Memory estimate
-    param_bytes = sum(
-        p.numel() * p.element_size() for p in model.parameters()
-    )
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     param_mb = param_bytes / (1024 ** 2)
 
     print(f"\n{'='*60}")
@@ -137,9 +123,8 @@ def print_model_summary(model) -> dict:
     print(f"  Parameter memory: {param_mb:.1f} MB")
     print(f"  Dtype:            {next(model.parameters()).dtype}")
 
-    # Count by module type
-    module_counts = {}
-    for name, module in model.named_modules():
+    module_counts: dict[str, int] = {}
+    for _name, module in model.named_modules():
         cls_name = module.__class__.__name__
         module_counts[cls_name] = module_counts.get(cls_name, 0) + 1
 
@@ -162,95 +147,76 @@ def create_dummy_image(size: tuple[int, int] = (224, 224)) -> Image.Image:
     return Image.new("RGB", size, color=(128, 128, 128))
 
 
-def check_forward_pass(model, processor, device: str) -> bool:
+def check_forward_pass(model, processor, device: str, method: Method = Method.OURS) -> bool:
     """Run a forward pass with dummy inputs and verify no errors."""
-    print("Running forward pass check...")
+    print(f"Running forward pass check (method={method.value})...")
 
+    sys_prompt, _ = get_prompts(method)
     dummy_image = create_dummy_image()
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": "What do you see in this image?\noptions: (A) normal (B) abnormal"},
+                {"type": "text", "text": "What do you see?\noptions: (A) normal (B) abnormal"},
             ],
         },
     ]
 
-    # Apply chat template
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(
-        text=[text],
-        images=[dummy_image],
-        return_tensors="pt",
-        padding=True,
-    )
-
-    # Move to device
+    inputs = processor(text=[text], images=[dummy_image], return_tensors="pt", padding=True)
     inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     with torch.no_grad():
         outputs = model(**inputs)
 
     logits = outputs.logits
-    print(f"  Forward pass OK. Logits shape: {logits.shape}")
-    print(f"  Vocab size: {logits.shape[-1]}")
-
+    print(f"  Forward pass OK. Logits shape: {logits.shape}, Vocab size: {logits.shape[-1]}")
     return True
 
 
-def check_generation(model, processor, device: str) -> str | None:
+def check_generation(model, processor, device: str, method: Method = Method.OURS) -> str:
     """Generate a short completion and return the text."""
-    print("Running generation check...")
+    print(f"Running generation check (method={method.value})...")
 
+    sys_prompt, _ = get_prompts(method)
     dummy_image = create_dummy_image()
+
+    if method == Method.BASELINE:
+        user_text = (
+            "What type of medical image is this?\n"
+            "options: (A) X-ray (B) MRI (C) CT scan (D) Ultrasound\n\n"
+            "Respond with <think>...</think><answer>LETTER</answer>"
+        )
+    else:
+        user_text = (
+            "What type of medical image is this?\n"
+            "options: (A) X-ray (B) MRI (C) CT scan (D) Ultrasound\n\n"
+            "Respond with <think><modality>...</modality>"
+            "<concepts>[...]</concepts>reasoning</think>"
+            "<answer>LETTER</answer>"
+        )
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {
-                    "type": "text",
-                    "text": (
-                        "What type of medical image is this?\n"
-                        "options: (A) X-ray (B) MRI (C) CT scan (D) Ultrasound\n\n"
-                        "Respond with <think>...</think><answer>LETTER</answer>"
-                    ),
-                },
-            ],
-        },
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]},
     ]
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(
-        text=[text],
-        images=[dummy_image],
-        return_tensors="pt",
-        padding=True,
-    )
+    inputs = processor(text=[text], images=[dummy_image], return_tensors="pt", padding=True)
     inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     with torch.no_grad():
         generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=EVAL_CFG.max_new_tokens,
-            temperature=EVAL_CFG.temperature,
-            top_p=EVAL_CFG.top_p,
-            do_sample=True,
+            **inputs, max_new_tokens=EVAL_CFG.max_new_tokens,
+            temperature=EVAL_CFG.temperature, top_p=EVAL_CFG.top_p, do_sample=True,
         )
 
-    # Decode only the generated tokens (strip the prompt)
     prompt_len = inputs["input_ids"].shape[1]
-    generated_text = processor.batch_decode(
-        generated_ids[:, prompt_len:],
-        skip_special_tokens=True,
-    )[0]
-
+    generated_text = processor.batch_decode(generated_ids[:, prompt_len:], skip_special_tokens=True)[0]
     print(f"  Generation OK. Length: {len(generated_text)} chars")
     print(f"  Output preview:\n    {generated_text[:300]}...")
-
     return generated_text
 
 
@@ -259,16 +225,9 @@ def check_tokenizer(processor) -> None:
     print("Checking tokenizer for R1 tags...")
 
     test_strings = [
-        "<think>",
-        "</think>",
-        "<answer>",
-        "</answer>",
-        "<modality>",
-        "</modality>",
-        "<concepts>",
-        "</concepts>",
+        "<think>", "</think>", "<answer>", "</answer>",
+        "<modality>", "</modality>", "<concepts>", "</concepts>",
     ]
-
     for s in test_strings:
         tokens = processor.tokenizer.encode(s, add_special_tokens=False)
         decoded = processor.tokenizer.decode(tokens)
@@ -286,22 +245,18 @@ def check_image_processing(processor) -> None:
         ("L (grayscale) 256x256", Image.new("L", (256, 256), 128)),
         ("RGB 1024x1024", Image.new("RGB", (1024, 1024), "green")),
     ]
-
     for name, img in test_cases:
         try:
-            # Convert to RGB if needed (Qwen2-VL expects RGB)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-
             dummy_text = processor.apply_chat_template(
                 [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "test"}]}],
-                tokenize=False,
-                add_generation_prompt=True,
+                tokenize=False, add_generation_prompt=True,
             )
             result = processor(text=[dummy_text], images=[img], return_tensors="pt")
-            pixel_shape = result.get("pixel_values", result.get("pixel_values_videos"))
-            if pixel_shape is not None:
-                print(f"  {name:30s} -> pixel_values shape: {pixel_shape.shape}")
+            pv = result.get("pixel_values", result.get("pixel_values_videos"))
+            if pv is not None:
+                print(f"  {name:30s} -> pixel_values shape: {pv.shape}")
             else:
                 print(f"  {name:30s} -> processed (no pixel_values key)")
         except Exception as e:
@@ -314,27 +269,22 @@ def run_all_checks(
     model_id: str = MODEL_ID,
     checkpoint_path: str | None = None,
     device: str | None = None,
+    method: Method = Method.OURS,
 ) -> dict:
     """Run all sanity checks and return results."""
-    results = {"model_id": model_id, "checks": {}}
+    results = {"model_id": model_id, "method": method.value, "checks": {}}
 
-    # Load
     model, processor, device = load_model_and_processor(
-        model_id=model_id,
-        checkpoint_path=checkpoint_path,
-        device=device,
+        model_id=model_id, checkpoint_path=checkpoint_path, device=device,
     )
-
-    # Summary
     stats = print_model_summary(model)
     results["model_stats"] = stats
 
-    # Checks
     checks = [
         ("tokenizer", lambda: check_tokenizer(processor)),
         ("image_processing", lambda: check_image_processing(processor)),
-        ("forward_pass", lambda: check_forward_pass(model, processor, device)),
-        ("generation", lambda: check_generation(model, processor, device)),
+        ("forward_pass", lambda: check_forward_pass(model, processor, device, method)),
+        ("generation", lambda: check_generation(model, processor, device, method)),
     ]
 
     for name, check_fn in checks:
@@ -346,7 +296,6 @@ def run_all_checks(
             results["checks"][name] = f"FAILED: {e}"
             print(f"  [{name}] FAILED: {e}\n")
 
-    # Final summary
     passed = sum(1 for v in results["checks"].values() if v == "PASSED")
     total = len(results["checks"])
     print(f"\n{'='*40}")
@@ -357,7 +306,6 @@ def run_all_checks(
         print(f"  [{icon}] {name}: {status}")
     print()
 
-    # Cleanup
     del model
     gc.collect()
     if torch.cuda.is_available():
@@ -370,37 +318,24 @@ def run_all_checks(
 
 def main():
     parser = argparse.ArgumentParser(description="Load and check MedVLM-R1 model")
-    parser.add_argument(
-        "--model-id", type=str, default=MODEL_ID,
-        help=f"HuggingFace model ID (default: {MODEL_ID})",
-    )
-    parser.add_argument(
-        "--checkpoint", type=str, default=None,
-        help="Path to a fine-tuned checkpoint directory",
-    )
-    parser.add_argument(
-        "--device", type=str, default=None,
-        choices=["cuda", "mps", "cpu"],
-        help="Device (auto-detected if not specified)",
-    )
-    parser.add_argument(
-        "--summary-only", action="store_true",
-        help="Only print model summary, skip inference checks",
-    )
+    parser.add_argument("--model-id", type=str, default=MODEL_ID)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"])
+    parser.add_argument("--method", type=str, default="ours", choices=["baseline", "ours"])
+    parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()
+
+    method = Method(args.method)
 
     if args.summary_only:
         model, processor, device = load_model_and_processor(
-            model_id=args.model_id,
-            checkpoint_path=args.checkpoint,
-            device=args.device,
+            model_id=args.model_id, checkpoint_path=args.checkpoint, device=args.device,
         )
         print_model_summary(model)
     else:
         run_all_checks(
-            model_id=args.model_id,
-            checkpoint_path=args.checkpoint,
-            device=args.device,
+            model_id=args.model_id, checkpoint_path=args.checkpoint,
+            device=args.device, method=method,
         )
 
 

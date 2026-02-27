@@ -1,23 +1,23 @@
 """
-demo_with_trained_model.py - Interactive demo for inference with a trained MedVLM-R1 model.
+demo_with_trained_model.py - Interactive demo for inference with a trained model.
 
-Responsibilities:
-  1. Load a trained checkpoint.
-  2. Accept an image (file path or URL) and a question.
-  3. Generate a structured R1-style response with modality, concepts, and answer.
-  4. Display the parsed output in a readable format.
-  5. Optionally run in batch mode on a directory of images.
+Supports both methods (--method baseline / --method ours):
+  - Baseline: expects <think>...</think><answer>...</answer>
+  - Ours: expects <think><modality>...</modality><concepts>...</concepts>...</think><answer>...</answer>
 
 Usage:
-  # Interactive single-image mode
+  # Single image (ours method)
   python demo_with_trained_model.py --checkpoint outputs/checkpoints/best \
       --image path/to/xray.png \
       --question "Is there evidence of pneumonia?\noptions: (A) yes (B) no"
 
-  # Batch mode on a directory
+  # Baseline method
   python demo_with_trained_model.py --checkpoint outputs/checkpoints/best \
-      --image-dir path/to/images/ \
-      --question "Select the most likely diagnosis.\noptions: (A) normal (B) abnormal"
+      --method baseline --image path/to/xray.png --question "..."
+
+  # Batch mode
+  python demo_with_trained_model.py --checkpoint outputs/checkpoints/best \
+      --image-dir path/to/images/ --question "..."
 
   # Interactive loop
   python demo_with_trained_model.py --checkpoint outputs/checkpoints/best --interactive
@@ -39,18 +39,20 @@ from config import (
     EVAL_CFG,
     MODALITIES,
     MODEL_ID,
-    SYSTEM_PROMPT,
+    Method,
+    get_prompts,
 )
 from model_loader_and_checker import load_model_and_processor
+from train_eval import build_prompt_messages
 
 
 # ── Response Parsing ─────────────────────────────────────────────────────────
 
-def parse_response(text: str) -> dict:
+def parse_response(text: str, method: Method = Method.OURS) -> dict:
     """Parse a model response into structured components.
 
-    Returns dict with: modality, concepts, reasoning, answer_letter, answer_text,
-                       format_valid, raw
+    Returns dict with: modality, concepts, reasoning, answer_letter,
+                       answer_text, format_valid, raw
     """
     result = {
         "modality": "",
@@ -63,10 +65,16 @@ def parse_response(text: str) -> dict:
     }
 
     # Check format validity
-    pattern = r"<think>.*?<modality>.*?</modality>.*?<concepts>.*?</concepts>.*?</think>\s*<answer>.*?</answer>"
+    if method == Method.BASELINE:
+        pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    else:
+        pattern = (
+            r"<think>.*?<modality>.*?</modality>.*?<concepts>.*?</concepts>"
+            r".*?</think>\s*<answer>.*?</answer>"
+        )
     result["format_valid"] = bool(re.fullmatch(pattern, text.strip(), re.DOTALL))
 
-    # Extract modality
+    # Extract modality (ours only, but parse if present)
     mod_match = re.search(r"<modality>(.*?)</modality>", text, re.DOTALL)
     if mod_match:
         result["modality"] = mod_match.group(1).strip()
@@ -75,14 +83,14 @@ def parse_response(text: str) -> dict:
     con_match = re.search(r"<concepts>\s*\[(.*?)\]\s*</concepts>", text, re.DOTALL)
     if con_match:
         result["concepts"] = [
-            c.strip().strip("'\"") for c in con_match.group(1).split(",") if c.strip()
+            c.strip().strip("'\"")
+            for c in con_match.group(1).split(",") if c.strip()
         ]
 
-    # Extract reasoning (everything in <think> that's not modality/concepts tags)
+    # Extract reasoning
     think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
     if think_match:
         reasoning = think_match.group(1)
-        # Remove modality and concepts tags
         reasoning = re.sub(r"<modality>.*?</modality>", "", reasoning, flags=re.DOTALL)
         reasoning = re.sub(r"<concepts>.*?</concepts>", "", reasoning, flags=re.DOTALL)
         result["reasoning"] = reasoning.strip()
@@ -107,6 +115,7 @@ def predict(
     image: Image.Image,
     question: str,
     device: str,
+    method: Method = Method.OURS,
     temperature: float = EVAL_CFG.temperature,
     max_new_tokens: int = EVAL_CFG.max_new_tokens,
 ) -> dict:
@@ -114,33 +123,17 @@ def predict(
 
     Returns parsed response dict.
     """
-    modalities_str = ", ".join(MODALITIES)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {
-                    "type": "text",
-                    "text": (
-                        f"{question}\n\n"
-                        f"Identify the modality from: {modalities_str}\n"
-                        "Respond with <think><modality>...</modality>"
-                        "<concepts>[...]</concepts>reasoning</think>"
-                        "<answer>LETTER</answer>"
-                    ),
-                },
-            ],
-        },
-    ]
-
+    messages = build_prompt_messages(question, method)
     text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True,
     )
-    inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    inputs = processor(
+        text=[text], images=[image], return_tensors="pt", padding=True,
+    )
+    inputs = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in inputs.items()
+    }
 
     with torch.no_grad():
         generated_ids = model.generate(
@@ -153,38 +146,43 @@ def predict(
 
     prompt_len = inputs["input_ids"].shape[1]
     completion = processor.batch_decode(
-        generated_ids[:, prompt_len:], skip_special_tokens=True
+        generated_ids[:, prompt_len:], skip_special_tokens=True,
     )[0]
 
-    return parse_response(completion)
+    return parse_response(completion, method)
 
 
 # ── Display ──────────────────────────────────────────────────────────────────
 
-def display_result(result: dict, image_path: str = "") -> None:
+def display_result(
+    result: dict, image_path: str = "", method: Method = Method.OURS,
+) -> None:
     """Pretty-print a prediction result."""
     fmt_status = "VALID" if result["format_valid"] else "INVALID"
-    fmt_color = "" if result["format_valid"] else " [!]"
+    fmt_marker = "" if result["format_valid"] else " [!]"
 
     print(f"\n{'='*60}")
     if image_path:
-        print(f"Image: {image_path}")
-    print(f"Format: {fmt_status}{fmt_color}")
+        print(f"Image:  {image_path}")
+    print(f"Method: {method.value}")
+    print(f"Format: {fmt_status}{fmt_marker}")
     print(f"{'─'*60}")
-    print(f"Modality:  {result['modality'] or '(not detected)'}")
-    print(f"Concepts:  {result['concepts'] or '(none detected)'}")
 
-    # Validate concepts against known list
-    if result["modality"] and result["modality"] in CONCEPT_MAP:
-        valid_concepts = set(CONCEPT_MAP[result["modality"]])
-        for c in result["concepts"]:
-            status = "known" if c in valid_concepts else "UNKNOWN"
-            if status == "UNKNOWN":
-                print(f"           ^ '{c}' is not in the {result['modality']} concept list")
+    if method == Method.OURS:
+        print(f"Modality:  {result['modality'] or '(not detected)'}")
+        print(f"Concepts:  {result['concepts'] or '(none detected)'}")
 
-    print(f"{'─'*60}")
+        # Validate concepts against known list
+        if result["modality"] and result["modality"] in CONCEPT_MAP:
+            valid_concepts = set(CONCEPT_MAP[result["modality"]])
+            for c in result["concepts"]:
+                if c not in valid_concepts:
+                    print(f"           ^ '{c}' is not in the "
+                          f"{result['modality']} concept list")
+        print(f"{'─'*60}")
+
     if result["reasoning"]:
-        print(f"Reasoning:")
+        print("Reasoning:")
         for line in result["reasoning"].split("\n"):
             if line.strip():
                 print(f"  {line.strip()}")
@@ -201,6 +199,7 @@ def run_batch(
     image_dir: str,
     question: str,
     device: str,
+    method: Method = Method.OURS,
     extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".tiff"),
 ) -> list[dict]:
     """Run inference on all images in a directory."""
@@ -223,28 +222,29 @@ def run_batch(
         if img.mode != "RGB":
             img = img.convert("RGB")
 
-        result = predict(model, processor, img, question, device)
+        result = predict(model, processor, img, question, device, method)
         result["image_path"] = str(img_path)
         results.append(result)
-        display_result(result, str(img_path))
+        display_result(result, str(img_path), method)
 
     # Summary
     print(f"\n{'='*60}")
-    print(f"BATCH SUMMARY ({len(results)} images)")
+    print(f"BATCH SUMMARY ({len(results)} images, method={method.value})")
     print(f"{'='*60}")
     print(f"  Format valid: {sum(r['format_valid'] for r in results)}/{len(results)}")
 
     answer_dist = {}
     for r in results:
-        l = r["answer_letter"] or "?"
-        answer_dist[l] = answer_dist.get(l, 0) + 1
+        letter = r["answer_letter"] or "?"
+        answer_dist[letter] = answer_dist.get(letter, 0) + 1
     print(f"  Answer distribution: {answer_dist}")
 
-    modality_dist = {}
-    for r in results:
-        m = r["modality"] or "unknown"
-        modality_dist[m] = modality_dist.get(m, 0) + 1
-    print(f"  Modality distribution: {modality_dist}")
+    if method == Method.OURS:
+        modality_dist = {}
+        for r in results:
+            m = r["modality"] or "unknown"
+            modality_dist[m] = modality_dist.get(m, 0) + 1
+        print(f"  Modality distribution: {modality_dist}")
     print(f"{'='*60}")
 
     return results
@@ -252,15 +252,16 @@ def run_batch(
 
 # ── Interactive Mode ─────────────────────────────────────────────────────────
 
-def interactive_loop(model, processor, device: str) -> None:
+def interactive_loop(
+    model, processor, device: str, method: Method = Method.OURS,
+) -> None:
     """Interactive loop: user provides image path and question, gets prediction."""
-    print("\n" + "="*60)
-    print("MedVLM-R1 Interactive Demo")
+    print(f"\n{'='*60}")
+    print(f"MedVLM-R1 Interactive Demo (method={method.value})")
     print("Type 'quit' or 'exit' to stop.")
-    print("="*60 + "\n")
+    print(f"{'='*60}\n")
 
     while True:
-        # Get image path
         image_path = input("Image path (or 'quit'): ").strip()
         if image_path.lower() in ("quit", "exit", "q"):
             print("Goodbye!")
@@ -270,7 +271,6 @@ def interactive_loop(model, processor, device: str) -> None:
             print(f"  File not found: {image_path}")
             continue
 
-        # Get question
         print("Enter question (end with empty line):")
         lines = []
         while True:
@@ -285,14 +285,13 @@ def interactive_loop(model, processor, device: str) -> None:
 
         question = "\n".join(lines)
 
-        # Run inference
         try:
             img = Image.open(image_path)
             if img.mode != "RGB":
                 img = img.convert("RGB")
 
-            result = predict(model, processor, img, question, device)
-            display_result(result, image_path)
+            result = predict(model, processor, img, question, device, method)
+            display_result(result, image_path, method)
         except Exception as e:
             print(f"  Error: {e}")
 
@@ -300,31 +299,31 @@ def interactive_loop(model, processor, device: str) -> None:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Demo with trained MedVLM-R1 model")
+    parser = argparse.ArgumentParser(
+        description="Demo with trained MedVLM-R1 model",
+    )
     parser.add_argument(
         "--checkpoint", type=str, required=True,
         help="Path to trained checkpoint directory",
     )
     parser.add_argument("--model-id", type=str, default=MODEL_ID)
-    parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"])
+    parser.add_argument("--device", type=str, default=None,
+                        choices=["cuda", "mps", "cpu"])
+    parser.add_argument("--method", type=str, default="ours",
+                        choices=["baseline", "ours"])
 
-    # Input modes (mutually exclusive)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--image", type=str, help="Path to a single image file")
-    group.add_argument("--image-dir", type=str, help="Path to a directory of images")
+    group.add_argument("--image-dir", type=str, help="Directory of images")
     group.add_argument("--interactive", action="store_true", help="Interactive mode")
 
-    parser.add_argument(
-        "--question", type=str, default=None,
-        help="Question text (required for --image and --image-dir modes)",
-    )
+    parser.add_argument("--question", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=EVAL_CFG.temperature)
     parser.add_argument("--max-tokens", type=int, default=EVAL_CFG.max_new_tokens)
-    parser.add_argument(
-        "--output-json", type=str, default=None,
-        help="Save results to JSON file",
-    )
+    parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
+
+    method = Method(args.method)
 
     # Load model
     model, processor, device = load_model_and_processor(
@@ -334,7 +333,7 @@ def main():
     )
 
     if args.interactive:
-        interactive_loop(model, processor, device)
+        interactive_loop(model, processor, device, method)
 
     elif args.image:
         if not args.question:
@@ -345,11 +344,11 @@ def main():
             img = img.convert("RGB")
 
         result = predict(
-            model, processor, img, args.question, device,
+            model, processor, img, args.question, device, method,
             temperature=args.temperature,
             max_new_tokens=args.max_tokens,
         )
-        display_result(result, args.image)
+        display_result(result, args.image, method)
 
         if args.output_json:
             with open(args.output_json, "w") as f:
@@ -361,7 +360,7 @@ def main():
             parser.error("--question is required with --image-dir")
 
         results = run_batch(
-            model, processor, args.image_dir, args.question, device
+            model, processor, args.image_dir, args.question, device, method,
         )
 
         if args.output_json:
@@ -370,8 +369,7 @@ def main():
             print(f"Saved {len(results)} results to {args.output_json}")
 
     else:
-        # Default: interactive mode
-        interactive_loop(model, processor, device)
+        interactive_loop(model, processor, device, method)
 
 
 if __name__ == "__main__":
